@@ -384,6 +384,7 @@ async function buildPptx(filename, theme, slides) {
         if (card.desc) sl.addText(card.desc, { x: x + 0.12, y: y + (card.icon ? 1.5 : 0.98), w: cW - 0.24, h: cH - (card.icon ? 1.65 : 1.1), fontSize: 12, color: T.dark, fontFace: 'Arial', align: 'center', margin: 0 });
       });
 
+    } else if (slide.type === 'closing') {
       sl.background = { color: T.bg };
       sl.addShape(pres.shapes.OVAL, { x: 8, y: -0.8, w: 6.5, h: 6.5, fill: { color: T.gold, transparency: 90 }, line: { color: T.gold, transparency: 90 } });
       sl.addShape(pres.shapes.RECTANGLE, { x: 0, y: 0, w: W, h: 0.06, fill: { color: T.gold }, line: { color: T.gold } });
