@@ -301,7 +301,89 @@ async function buildPptx(filename, theme, slides) {
       const tH = Math.min(1.1 + (rows.length + 1) * 0.65, 6.1);
       sl.addTable(tData, { x: 0.4, y: 1.22, w: 12.5, h: tH, colW, border: { pt: 0.5, color: 'E0D8D0' }, rowH: 0.58 });
 
-    } else if (slide.type === 'closing') {
+    } else if (slide.type === 'chart') {
+      // 圖表版型：左側圖表 + 右側重點卡片
+      sl.background = { color: T.bg };
+      sl.addShape(pres.shapes.RECTANGLE, { x: 0, y: 0, w: W, h: 1.1, fill: { color: '120F0D' }, line: { color: '120F0D' } });
+      sl.addText(slide.title || '', { x: 0.6, y: 0.22, w: 12, h: 0.68, fontSize: 26, bold: true, color: T.gold, fontFace: 'Cambria', margin: 0 });
+
+      const chartType = slide.chartType || 'bar'; // bar, line, pie, doughnut
+      const chartData = slide.chartData || { labels: [], values: [] };
+      const chartColors = ['B8956A', '5FA878', '6A8FD4', 'D46A6A', 'C9A84C', 'A0B4C8'];
+
+      const pptChartType = {
+        bar: pres.charts.BAR,
+        line: pres.charts.LINE,
+        pie: pres.charts.PIE,
+        doughnut: pres.charts.DOUGHNUT,
+        column: pres.charts.BAR,
+      }[chartType] || pres.charts.BAR;
+
+      const chartW = slide.notes ? 7.8 : 12.5;
+      sl.addChart(pptChartType, [{
+        name: slide.chartLabel || '數據',
+        labels: chartData.labels || [],
+        values: chartData.values || [],
+      }], {
+        x: 0.4, y: 1.25, w: chartW, h: 5.95,
+        barDir: chartType === 'column' ? 'col' : 'bar',
+        chartColors,
+        chartArea: { fill: { color: '1E1A18' }, roundedCorners: true },
+        catAxisLabelColor: T.grayL,
+        valAxisLabelColor: T.grayL,
+        valGridLine: { color: '2E2A28', size: 0.5 },
+        catGridLine: { style: 'none' },
+        showValue: true,
+        dataLabelColor: T.white,
+        showLegend: false,
+        lineSize: chartType === 'line' ? 3 : undefined,
+        lineSmooth: chartType === 'line' ? true : undefined,
+        showPercent: (chartType === 'pie' || chartType === 'doughnut'),
+        legendColor: T.grayL,
+        legendPos: (chartType === 'pie' || chartType === 'doughnut') ? 'r' : undefined,
+      });
+
+      // 右側重點（選用）
+      if (slide.notes && Array.isArray(slide.notes)) {
+        const noteColors = ['B8956A', '5FA878', '6A8FD4'];
+        slide.notes.forEach((n, i) => {
+          const y = 1.25 + i * 2.0;
+          sl.addShape(pres.shapes.ROUNDED_RECTANGLE, { x: 8.5, y, w: 4.4, h: 1.75, fill: { color: '1E1A18' }, line: { color: noteColors[i % 3], width: 1.5 }, rectRadius: 0.14, shadow: mk() });
+          if (n.value) sl.addText(n.value, { x: 8.5, y: y + 0.1, w: 4.4, h: 0.7, fontSize: 36, bold: true, color: noteColors[i % 3], fontFace: 'Cambria', align: 'center', margin: 0 });
+          if (n.label) sl.addText(n.label, { x: 8.6, y: y + 0.85, w: 4.2, h: 0.65, fontSize: 13, color: T.text, fontFace: 'Arial', align: 'center', margin: 0 });
+        });
+      }
+
+    } else if (slide.type === 'cards') {
+      // 卡片矩陣版型：標題 + 2×2 或 1×3 卡片格
+      sl.background = { color: T.light };
+      sl.addShape(pres.shapes.RECTANGLE, { x: 0, y: 0, w: W, h: 1.1, fill: { color: T.dark }, line: { color: T.dark } });
+      sl.addText(slide.title || '', { x: 0.6, y: 0.22, w: 12, h: 0.68, fontSize: 26, bold: true, color: T.gold, fontFace: 'Cambria', margin: 0 });
+
+      const cards = slide.cards || [];
+      const cardColors = ['B8956A', '5FA878', '6A8FD4', 'D46A6A', 'C9A84C', 'A0B4C8'];
+      const cols = cards.length <= 3 ? cards.length : 2;
+      const rows = Math.ceil(cards.length / cols);
+      const cW = (W - 0.4 * (cols + 1)) / cols;
+      const cH = (5.85 - 0.3 * (rows + 1)) / rows;
+
+      cards.forEach((card, i) => {
+        const col = i % cols;
+        const row = Math.floor(i / cols);
+        const x = 0.4 + col * (cW + 0.4);
+        const y = 1.25 + row * (cH + 0.3);
+        const color = cardColors[i % cardColors.length];
+
+        sl.addShape(pres.shapes.ROUNDED_RECTANGLE, { x, y, w: cW, h: cH, fill: { color: T.white }, line: { color: 'E8E0D8', width: 0.5 }, rectRadius: 0.12, shadow: mk() });
+        // 頂部色條
+        sl.addShape(pres.shapes.ROUNDED_RECTANGLE, { x, y, w: cW, h: 0.28, fill: { color: color }, line: { color: color }, rectRadius: 0.06 });
+        sl.addShape(pres.shapes.RECTANGLE, { x, y: y + 0.14, w: cW, h: 0.14, fill: { color: color }, line: { color: color } });
+
+        if (card.icon) sl.addText(card.icon, { x, y: y + 0.38, w: cW, h: 0.55, fontSize: 24, align: 'center', margin: 0 });
+        if (card.title) sl.addText(card.title, { x: x + 0.1, y: y + (card.icon ? 0.95 : 0.4), w: cW - 0.2, h: 0.5, fontSize: 14, bold: true, color: color, fontFace: 'Arial', align: 'center', margin: 0 });
+        if (card.desc) sl.addText(card.desc, { x: x + 0.12, y: y + (card.icon ? 1.5 : 0.98), w: cW - 0.24, h: cH - (card.icon ? 1.65 : 1.1), fontSize: 12, color: T.dark, fontFace: 'Arial', align: 'center', margin: 0 });
+      });
+
       sl.background = { color: T.bg };
       sl.addShape(pres.shapes.OVAL, { x: 8, y: -0.8, w: 6.5, h: 6.5, fill: { color: T.gold, transparency: 90 }, line: { color: T.gold, transparency: 90 } });
       sl.addShape(pres.shapes.RECTANGLE, { x: 0, y: 0, w: W, h: 0.06, fill: { color: T.gold }, line: { color: T.gold } });
