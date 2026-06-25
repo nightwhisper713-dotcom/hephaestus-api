@@ -1,0 +1,525 @@
+// ═══════════════════════════════════════════════════════════
+// HEPHAESTUS API — 文件鍛造服務
+// 支援：PPT / Excel（多檔合併）/ Word
+// 部署：Render 免費方案
+// ═══════════════════════════════════════════════════════════
+
+const express  = require('express');
+const cors     = require('cors');
+const multer   = require('multer');
+const XLSX     = require('xlsx');
+const PptxGenJS = require('pptxgenjs');
+const { Document, Packer, Paragraph, TextRun, HeadingLevel,
+        Table, TableRow, TableCell, AlignmentType, WidthType,
+        BorderStyle, ShadingType, Header, Footer, PageNumber,
+        TableOfContents } = require('docx');
+const archiver = require('archiver');
+const path     = require('path');
+const fs       = require('fs');
+const os       = require('os');
+
+const app = express();
+app.use(cors());
+app.use(express.json({ limit: '50mb' }));
+
+// Multer — 記憶體儲存，支援多檔
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 20 * 1024 * 1024 } // 20MB per file
+});
+
+// ── 健康檢查 ───────────────────────────────────────────────
+app.get('/', (req, res) => res.json({
+  service: 'HEPHAESTUS API',
+  version: '1.0.0',
+  endpoints: ['/generate/ppt', '/generate/excel', '/generate/word', '/generate/merge-excel', '/generate/bundle']
+}));
+
+// ═══════════════════════════════════════════════════════════
+// PPT 生成
+// POST /generate/ppt
+// Body: { filename, theme?, slides: [{type, title, bullets?, ...}] }
+// ═══════════════════════════════════════════════════════════
+app.post('/generate/ppt', async (req, res) => {
+  try {
+    const { filename = '簡報', theme = {}, slides = [] } = req.body;
+    const buf = await buildPptx(filename, theme, slides);
+    res.set({
+      'Content-Type': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+      'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(filename)}.pptx`,
+      'Content-Length': buf.length
+    });
+    res.send(buf);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════
+// Excel 生成
+// POST /generate/excel
+// Body: { filename, sheets: [{name, headers, rows, widths?, formulas?}] }
+// ═══════════════════════════════════════════════════════════
+app.post('/generate/excel', async (req, res) => {
+  try {
+    const { filename = '試算表', sheets = [] } = req.body;
+    const buf = buildExcel(filename, sheets);
+    res.set({
+      'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(filename)}.xlsx`,
+      'Content-Length': buf.length
+    });
+    res.send(buf);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════
+// Excel 多檔合併
+// POST /generate/merge-excel   (multipart/form-data)
+// Fields: files[] (xlsx), mode (stack|sheet), outputName
+// ═══════════════════════════════════════════════════════════
+app.post('/generate/merge-excel', upload.array('files', 20), async (req, res) => {
+  try {
+    const { mode = 'sheet', outputName = '合併試算表' } = req.body;
+    if (!req.files || req.files.length === 0) throw new Error('未收到任何檔案');
+
+    const wb = XLSX.utils.book_new();
+    const allData = []; // for stack mode
+
+    req.files.forEach((file, idx) => {
+      const srcWb = XLSX.read(file.buffer, { type: 'buffer', cellStyles: true, cellDates: true });
+
+      if (mode === 'sheet') {
+        // 每個檔案的每個工作表獨立放進新工作簿
+        srcWb.SheetNames.forEach(name => {
+          const ws = srcWb.Sheets[name];
+          const sheetName = req.files.length > 1
+            ? `${path.basename(file.originalname, path.extname(file.originalname))}_${name}`.slice(0, 31)
+            : name.slice(0, 31);
+          XLSX.utils.book_append_sheet(wb, ws, sheetName);
+        });
+      } else {
+        // stack mode：把所有第一個工作表的資料垂直疊加
+        const ws = srcWb.Sheets[srcWb.SheetNames[0]];
+        const data = XLSX.utils.sheet_to_json(ws, { header: 1 });
+        if (idx === 0) {
+          allData.push(...data); // 保留標題列
+        } else {
+          allData.push(...data.slice(1)); // 跳過標題列
+        }
+      }
+    });
+
+    if (mode === 'stack') {
+      const ws = XLSX.utils.aoa_to_sheet(allData);
+      // 自動欄寬
+      const cols = allData[0] ? allData[0].map((_, i) => ({
+        wch: Math.max(...allData.map(row => String(row[i] || '').length), 8)
+      })) : [];
+      ws['!cols'] = cols;
+      // 凍結首列
+      ws['!freeze'] = { xSplit: 0, ySplit: 1 };
+      XLSX.utils.book_append_sheet(wb, ws, '合併資料');
+
+      // 加總覽工作表
+      const summaryWs = XLSX.utils.aoa_to_sheet([
+        ['統計項目', '數值'],
+        ['來源檔案數', req.files.length],
+        ['合計資料列數', allData.length - 1],
+        ['欄位數', allData[0] ? allData[0].length : 0],
+        ['產生時間', new Date().toLocaleString('zh-TW')]
+      ]);
+      summaryWs['!cols'] = [{ wch: 16 }, { wch: 24 }];
+      XLSX.utils.book_append_sheet(wb, summaryWs, '合併總覽');
+    }
+
+    const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+    res.set({
+      'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(outputName)}.xlsx`
+    });
+    res.send(buf);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════
+// Word 生成
+// POST /generate/word
+// Body: { filename, sections: [{type, text, items?, headers?, rows?}] }
+// ═══════════════════════════════════════════════════════════
+app.post('/generate/word', async (req, res) => {
+  try {
+    const { filename = '文件', sections = [], brand = '幻翔商用設計' } = req.body;
+    const buf = await buildWord(filename, sections, brand);
+    res.set({
+      'Content-Type': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(filename)}.docx`
+    });
+    res.send(buf);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════
+// 打包下載（同時生成多種格式，回傳 ZIP）
+// POST /generate/bundle
+// Body: { ppt?, excel?, word?, zipName? }
+// ═══════════════════════════════════════════════════════════
+app.post('/generate/bundle', async (req, res) => {
+  try {
+    const { ppt, excel, word, zipName = '幻翔文件包' } = req.body;
+    res.set({
+      'Content-Type': 'application/zip',
+      'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(zipName)}.zip`
+    });
+    const archive = archiver('zip', { zlib: { level: 6 } });
+    archive.pipe(res);
+
+    if (ppt) {
+      const buf = await buildPptx(ppt.filename || '簡報', ppt.theme || {}, ppt.slides || []);
+      archive.append(buf, { name: `${ppt.filename || '簡報'}.pptx` });
+    }
+    if (excel) {
+      const buf = buildExcel(excel.filename || '試算表', excel.sheets || []);
+      archive.append(buf, { name: `${excel.filename || '試算表'}.xlsx` });
+    }
+    if (word) {
+      const buf = await buildWord(word.filename || '文件', word.sections || []);
+      archive.append(buf, { name: `${word.filename || '文件'}.docx` });
+    }
+    await archive.finalize();
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════
+// PPT 建構函數
+// ═══════════════════════════════════════════════════════════
+async function buildPptx(filename, theme, slides) {
+  const pres = new PptxGenJS();
+  pres.layout = 'LAYOUT_WIDE';
+  pres.author = '幻翔商用設計 · HEPHAESTUS API';
+
+  const T = {
+    bg:      theme.bg      || '1A1614',
+    gold:    theme.gold    || 'B8956A',
+    text:    theme.text    || 'F0EBE2',
+    accent:  theme.accent  || '5FA878',
+    light:   theme.light   || 'F7F4F0',
+    dark:    theme.dark    || '1A1614',
+    white:   'FFFFFF',
+    gray:    '8A8078',
+    grayL:   'C8C0B8',
+  };
+  const W = 13.3, H = 7.5;
+  const mk = () => ({ type: 'outer', color: '000000', blur: 8, offset: 2, angle: 45, opacity: 0.10 });
+
+  slides.forEach(slide => {
+    const sl = pres.addSlide();
+
+    if (slide.type === 'title') {
+      sl.background = { color: T.bg };
+      sl.addShape(pres.shapes.OVAL, { x: 9, y: -1, w: 6, h: 6, fill: { color: T.gold, transparency: 88 }, line: { color: T.gold, transparency: 88 } });
+      sl.addShape(pres.shapes.RECTANGLE, { x: 0, y: 0, w: W, h: 0.06, fill: { color: T.gold }, line: { color: T.gold } });
+      sl.addText(slide.title || '', { x: 1, y: 1.8, w: 11.3, h: 1.2, fontSize: 44, bold: true, color: T.gold, fontFace: 'Cambria', align: 'center', margin: 0 });
+      if (slide.subtitle) sl.addText(slide.subtitle, { x: 1, y: 3.15, w: 11.3, h: 0.7, fontSize: 22, color: T.text, fontFace: 'Arial', align: 'center', italic: true, margin: 0 });
+      if (slide.date)  sl.addText(slide.date,  { x: 1, y: 4.0,  w: 11.3, h: 0.4, fontSize: 13, color: T.gray, fontFace: 'Arial', align: 'center', margin: 0 });
+      if (slide.brand) sl.addText(slide.brand, { x: 0, y: 7.1,  w: W,    h: 0.3, fontSize: 10, color: T.gray, fontFace: 'Arial', align: 'center', margin: 0 });
+
+    } else if (slide.type === 'content') {
+      sl.background = { color: T.light };
+      sl.addShape(pres.shapes.RECTANGLE, { x: 0, y: 0, w: W, h: 1.1, fill: { color: T.dark }, line: { color: T.dark } });
+      sl.addText(slide.title || '', { x: 0.6, y: 0.22, w: 12, h: 0.68, fontSize: 26, bold: true, color: T.gold, fontFace: 'Cambria', margin: 0 });
+      if (slide.subtitle) sl.addText(slide.subtitle, { x: 0.6, y: 0.82, w: 12, h: 0.25, fontSize: 10, color: T.grayL, fontFace: 'Arial', italic: true, margin: 0 });
+      const bullets = slide.bullets || [];
+      bullets.forEach((b, i) => {
+        sl.addShape(pres.shapes.ROUNDED_RECTANGLE, { x: 0.45, y: 1.25 + i * 0.92, w: 12.4, h: 0.78, fill: { color: T.white }, line: { color: 'E8E0D8', width: 0.5 }, rectRadius: 0.06, shadow: mk() });
+        sl.addText(b, { x: 0.65, y: 1.25 + i * 0.92, w: 12.1, h: 0.78, fontSize: 15, color: T.dark, fontFace: 'Arial', valign: 'middle', margin: 0 });
+      });
+
+    } else if (slide.type === 'stats') {
+      sl.background = { color: T.bg };
+      sl.addShape(pres.shapes.RECTANGLE, { x: 0, y: 0, w: W, h: 1.1, fill: { color: '120F0D' }, line: { color: '120F0D' } });
+      sl.addText(slide.title || '', { x: 0.6, y: 0.22, w: 12, h: 0.68, fontSize: 26, bold: true, color: T.gold, fontFace: 'Cambria', margin: 0 });
+      const stats = slide.stats || [];
+      const cols = Math.min(stats.length, 4);
+      const cardW = (W - 0.4 * (cols + 1)) / cols;
+      const statColors = [T.accent, T.gold, '6A8FD4', 'D46A6A', 'C9A84C'];
+      stats.forEach((s, i) => {
+        const x = 0.4 + i * (cardW + 0.4);
+        sl.addShape(pres.shapes.ROUNDED_RECTANGLE, { x, y: 1.28, w: cardW, h: 2.2, fill: { color: '1E1A18' }, line: { color: statColors[i % 5], width: 1.5 }, rectRadius: 0.14, shadow: mk() });
+        sl.addText(s.value || '', { x, y: 1.4, w: cardW, h: 0.9, fontSize: 46, bold: true, color: statColors[i % 5], fontFace: 'Cambria', align: 'center', margin: 0 });
+        sl.addText(s.label || '', { x: x + 0.1, y: 2.38, w: cardW - 0.2, h: 0.65, fontSize: 14, color: T.text, fontFace: 'Arial', align: 'center', margin: 0 });
+        if (s.sub) sl.addText(s.sub, { x: x + 0.1, y: 3.08, w: cardW - 0.2, h: 0.32, fontSize: 11, color: T.gray, fontFace: 'Arial', align: 'center', italic: true, margin: 0 });
+      });
+      if (slide.note) sl.addText(slide.note, { x: 0.4, y: 3.6, w: 12.5, h: 0.4, fontSize: 12, color: T.gold, fontFace: 'Arial', align: 'center', italic: true, margin: 0 });
+
+    } else if (slide.type === 'two_col') {
+      sl.background = { color: T.light };
+      sl.addShape(pres.shapes.RECTANGLE, { x: 0, y: 0, w: W, h: 1.1, fill: { color: T.dark }, line: { color: T.dark } });
+      sl.addText(slide.title || '', { x: 0.6, y: 0.22, w: 12, h: 0.68, fontSize: 26, bold: true, color: T.gold, fontFace: 'Cambria', margin: 0 });
+      const leftItems = slide.left || [];
+      const rightItems = slide.right || [];
+      const leftLabel = slide.leftLabel || '左欄';
+      const rightLabel = slide.rightLabel || '右欄';
+      // Left header
+      sl.addShape(pres.shapes.ROUNDED_RECTANGLE, { x: 0.4, y: 1.22, w: 5.9, h: 0.5, fill: { color: T.gold }, line: { color: T.gold }, rectRadius: 0.06 });
+      sl.addText(leftLabel, { x: 0.4, y: 1.22, w: 5.9, h: 0.5, fontSize: 14, bold: true, color: T.dark, fontFace: 'Arial', align: 'center', margin: 0 });
+      leftItems.forEach((item, i) => {
+        sl.addShape(pres.shapes.ROUNDED_RECTANGLE, { x: 0.4, y: 1.85 + i * 0.82, w: 5.9, h: 0.7, fill: { color: T.white }, line: { color: 'E8E0D8', width: 0.5 }, rectRadius: 0.06, shadow: mk() });
+        sl.addText(item, { x: 0.55, y: 1.85 + i * 0.82, w: 5.6, h: 0.7, fontSize: 13, color: T.dark, fontFace: 'Arial', valign: 'middle', margin: 0 });
+      });
+      // Right header
+      sl.addShape(pres.shapes.ROUNDED_RECTANGLE, { x: 7.0, y: 1.22, w: 5.9, h: 0.5, fill: { color: '6A8FD4' }, line: { color: '6A8FD4' }, rectRadius: 0.06 });
+      sl.addText(rightLabel, { x: 7.0, y: 1.22, w: 5.9, h: 0.5, fontSize: 14, bold: true, color: T.white, fontFace: 'Arial', align: 'center', margin: 0 });
+      rightItems.forEach((item, i) => {
+        sl.addShape(pres.shapes.ROUNDED_RECTANGLE, { x: 7.0, y: 1.85 + i * 0.82, w: 5.9, h: 0.7, fill: { color: T.white }, line: { color: 'E8E0D8', width: 0.5 }, rectRadius: 0.06, shadow: mk() });
+        sl.addText(item, { x: 7.15, y: 1.85 + i * 0.82, w: 5.6, h: 0.7, fontSize: 13, color: T.dark, fontFace: 'Arial', valign: 'middle', margin: 0 });
+      });
+
+    } else if (slide.type === 'table') {
+      sl.background = { color: T.light };
+      sl.addShape(pres.shapes.RECTANGLE, { x: 0, y: 0, w: W, h: 1.1, fill: { color: T.dark }, line: { color: T.dark } });
+      sl.addText(slide.title || '', { x: 0.6, y: 0.22, w: 12, h: 0.68, fontSize: 26, bold: true, color: T.gold, fontFace: 'Cambria', margin: 0 });
+      const headers = slide.headers || [];
+      const rows    = slide.rows    || [];
+      const nCols   = headers.length || (rows[0] ? rows[0].length : 1);
+      const colW    = slide.colWidths || headers.map(() => 12.5 / nCols);
+      const tData   = [
+        headers.map(h => ({ text: h, options: { bold: true, fontSize: 11, fontFace: 'Arial', color: T.white, fill: { color: T.dark }, align: 'center', valign: 'middle' } })),
+        ...rows.map((row, ri) => row.map((cell, ci) => ({
+          text: String(cell ?? ''),
+          options: { fontSize: 12, fontFace: 'Arial', color: ci === 0 ? T.dark : '3A3028', fill: { color: ri % 2 === 0 ? 'FAFAF8' : T.white }, align: ci === 0 ? 'left' : 'center', valign: 'middle' }
+        })))
+      ];
+      const tH = Math.min(1.1 + (rows.length + 1) * 0.65, 6.1);
+      sl.addTable(tData, { x: 0.4, y: 1.22, w: 12.5, h: tH, colW, border: { pt: 0.5, color: 'E0D8D0' }, rowH: 0.58 });
+
+    } else if (slide.type === 'closing') {
+      sl.background = { color: T.bg };
+      sl.addShape(pres.shapes.OVAL, { x: 8, y: -0.8, w: 6.5, h: 6.5, fill: { color: T.gold, transparency: 90 }, line: { color: T.gold, transparency: 90 } });
+      sl.addShape(pres.shapes.RECTANGLE, { x: 0, y: 0, w: W, h: 0.06, fill: { color: T.gold }, line: { color: T.gold } });
+      sl.addText(slide.title || '', { x: 0.5, y: 1.8, w: 12.3, h: 1.1, fontSize: 48, bold: true, color: T.gold, fontFace: 'Cambria', align: 'center', margin: 0 });
+      if (slide.subtitle) sl.addText(slide.subtitle, { x: 0.5, y: 3.1, w: 12.3, h: 0.7, fontSize: 22, color: T.text, fontFace: 'Arial', align: 'center', margin: 0 });
+      if (slide.contact) {
+        const items = Array.isArray(slide.contact) ? slide.contact : [slide.contact];
+        items.forEach((c, i) => {
+          const x = 0.5 + i * (12.3 / items.length);
+          const w = 12.3 / items.length - 0.2;
+          sl.addShape(pres.shapes.ROUNDED_RECTANGLE, { x, y: 4.1, w, h: 1.1, fill: { color: '221E1B' }, line: { color: '3A3430', width: 1 }, rectRadius: 0.12, shadow: mk() });
+          sl.addText(c, { x, y: 4.12, w, h: 1.1, fontSize: 12, color: T.text, fontFace: 'Arial', align: 'center', valign: 'middle', margin: 0 });
+        });
+      }
+      if (slide.brand) sl.addText(slide.brand, { x: 0, y: 7.1, w: W, h: 0.3, fontSize: 10, color: T.gray, fontFace: 'Arial', align: 'center', margin: 0 });
+    }
+  });
+
+  return pres.write({ outputType: 'nodebuffer' });
+}
+
+// ═══════════════════════════════════════════════════════════
+// Excel 建構函數（智慧試算表）
+// ═══════════════════════════════════════════════════════════
+function buildExcel(filename, sheets) {
+  const wb = XLSX.utils.book_new();
+
+  sheets.forEach(sheet => {
+    const headers = sheet.headers || [];
+    const rows    = sheet.rows    || [];
+    const aoa     = [headers, ...rows];
+    const ws      = XLSX.utils.aoa_to_sheet(aoa);
+
+    // 自動欄寬
+    const maxW = headers.map((h, ci) =>
+      Math.max(
+        String(h).length + 2,
+        ...rows.map(r => String(r[ci] ?? '').length),
+        6
+      )
+    );
+    ws['!cols'] = maxW.map(w => ({ wch: Math.min(w, 40) }));
+
+    // 凍結首列
+    ws['!freeze'] = { xSplit: 0, ySplit: 1 };
+
+    // 自動篩選
+    if (headers.length > 0 && rows.length > 0) {
+      ws['!autofilter'] = { ref: XLSX.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: rows.length, c: headers.length - 1 } }) };
+    }
+
+    // 加入公式列（如果 sheet.addSummary = true）
+    if (sheet.addSummary && rows.length > 0) {
+      const summaryRow = headers.map((h, ci) => {
+        const colLetter = XLSX.utils.encode_col(ci);
+        const isNumeric = rows.every(r => r[ci] !== null && r[ci] !== undefined && !isNaN(Number(r[ci])));
+        if (isNumeric && ci > 0) {
+          return { f: `SUM(${colLetter}2:${colLetter}${rows.length + 1})` };
+        }
+        return ci === 0 ? '合計' : '';
+      });
+      XLSX.utils.sheet_add_aoa(ws, [summaryRow], { origin: -1 });
+    }
+
+    // 自訂公式（sheet.formulas = [{cell, formula}]）
+    if (sheet.formulas) {
+      sheet.formulas.forEach(f => {
+        ws[f.cell] = { t: 'n', f: f.formula };
+      });
+    }
+
+    XLSX.utils.book_append_sheet(wb, ws, (sheet.name || `Sheet${sheets.indexOf(sheet)+1}`).slice(0, 31));
+  });
+
+  return XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+}
+
+// ═══════════════════════════════════════════════════════════
+// Word 建構函數（品牌樣式）
+// ═══════════════════════════════════════════════════════════
+async function buildWord(filename, sections, brand = '幻翔商用設計') {
+  const GOLD = 'B8956A';
+  const DARK = '1A1614';
+
+  const children = [];
+
+  sections.forEach(sec => {
+    if (sec.type === 'h1') {
+      children.push(new Paragraph({
+        children: [new TextRun({ text: sec.text, bold: true, size: 36, color: GOLD, font: 'Cambria' })],
+        heading: HeadingLevel.HEADING_1,
+        spacing: { before: 360, after: 180 },
+        border: { bottom: { style: BorderStyle.SINGLE, size: 6, color: GOLD, space: 4 } }
+      }));
+    } else if (sec.type === 'h2') {
+      children.push(new Paragraph({
+        children: [new TextRun({ text: sec.text, bold: true, size: 28, color: DARK, font: 'Cambria' })],
+        heading: HeadingLevel.HEADING_2,
+        spacing: { before: 280, after: 140 }
+      }));
+    } else if (sec.type === 'h3') {
+      children.push(new Paragraph({
+        children: [new TextRun({ text: sec.text, bold: true, size: 24, color: '3A3028', font: 'Cambria' })],
+        heading: HeadingLevel.HEADING_3,
+        spacing: { before: 200, after: 100 }
+      }));
+    } else if (sec.type === 'p') {
+      children.push(new Paragraph({
+        children: [new TextRun({ text: sec.text, size: 24, font: 'Arial' })],
+        spacing: { before: 80, after: 80, line: 360 },
+        alignment: AlignmentType.JUSTIFIED
+      }));
+    } else if (sec.type === 'bullet') {
+      (sec.items || []).forEach(item => {
+        children.push(new Paragraph({
+          children: [new TextRun({ text: item, size: 24, font: 'Arial' })],
+          bullet: { level: 0 },
+          spacing: { before: 60, after: 60 }
+        }));
+      });
+    } else if (sec.type === 'numbered') {
+      (sec.items || []).forEach((item, i) => {
+        children.push(new Paragraph({
+          children: [new TextRun({ text: `${i + 1}.  ${item}`, size: 24, font: 'Arial' })],
+          spacing: { before: 60, after: 60 },
+          indent: { left: 400 }
+        }));
+      });
+    } else if (sec.type === 'callout') {
+      // 強調框
+      children.push(new Paragraph({
+        children: [new TextRun({ text: sec.text, size: 24, bold: true, color: DARK, font: 'Arial' })],
+        spacing: { before: 160, after: 160 },
+        indent: { left: 480, right: 480 },
+        shading: { type: ShadingType.SOLID, fill: 'FFF8EE', color: 'FFF8EE' },
+        border: {
+          left:   { style: BorderStyle.SINGLE, size: 18, color: GOLD, space: 8 },
+          top:    { style: BorderStyle.NONE },
+          right:  { style: BorderStyle.NONE },
+          bottom: { style: BorderStyle.NONE }
+        }
+      }));
+    } else if (sec.type === 'table') {
+      const hdrs = sec.headers || [];
+      const rows = sec.rows    || [];
+      const nCols = hdrs.length || (rows[0] ? rows[0].length : 1);
+      const colW  = Math.floor(9360 / nCols); // twips
+
+      const tableRows = [
+        // Header row
+        new TableRow({
+          children: hdrs.map(h => new TableCell({
+            children: [new Paragraph({ children: [new TextRun({ text: h, bold: true, size: 22, color: 'FFFFFF', font: 'Arial' })], alignment: AlignmentType.CENTER })],
+            shading: { type: ShadingType.SOLID, fill: DARK, color: DARK },
+            margins: { top: 80, bottom: 80, left: 120, right: 120 },
+            width: { size: colW, type: WidthType.DXA }
+          }))
+        }),
+        // Data rows
+        ...rows.map((row, ri) => new TableRow({
+          children: row.map((cell, ci) => new TableCell({
+            children: [new Paragraph({ children: [new TextRun({ text: String(cell ?? ''), size: 22, font: 'Arial' })], alignment: ci === 0 ? AlignmentType.LEFT : AlignmentType.CENTER })],
+            shading: { type: ShadingType.SOLID, fill: ri % 2 === 0 ? 'FAFAF8' : 'FFFFFF', color: 'auto' },
+            margins: { top: 60, bottom: 60, left: 120, right: 120 },
+            width: { size: colW, type: WidthType.DXA }
+          }))
+        }))
+      ];
+      children.push(new Table({
+        rows: tableRows,
+        width: { size: 9360, type: WidthType.DXA },
+        margins: { top: 160, bottom: 160 }
+      }));
+      children.push(new Paragraph({ text: '', spacing: { after: 160 } }));
+    } else if (sec.type === 'pagebreak') {
+      children.push(new Paragraph({ pageBreakBefore: true }));
+    }
+  });
+
+  const doc = new Document({
+    sections: [{
+      properties: {
+        page: {
+          margin: { top: 1440, bottom: 1440, left: 1440, right: 1440 }
+        }
+      },
+      headers: {
+        default: new Header({
+          children: [new Paragraph({
+            children: [
+              new TextRun({ text: brand + '  ·  ', size: 18, color: GOLD, font: 'Arial' }),
+              new TextRun({ text: filename, size: 18, color: '8A8078', font: 'Arial' })
+            ],
+            alignment: AlignmentType.RIGHT,
+            border: { bottom: { style: BorderStyle.SINGLE, size: 3, color: GOLD, space: 4 } }
+          })]
+        })
+      },
+      footers: {
+        default: new Footer({
+          children: [new Paragraph({
+            children: [
+              new TextRun({ text: `© ${new Date().getFullYear()} ${brand}    `, size: 16, color: '8A8078', font: 'Arial' }),
+              new TextRun({ children: [PageNumber.CURRENT], size: 16, color: '8A8078', font: 'Arial' }),
+              new TextRun({ text: ' / ', size: 16, color: '8A8078', font: 'Arial' }),
+              new TextRun({ children: [PageNumber.TOTAL_PAGES], size: 16, color: '8A8078', font: 'Arial' }),
+            ],
+            alignment: AlignmentType.CENTER
+          })]
+        })
+      },
+      children
+    }]
+  });
+
+  return Packer.toBuffer(doc);
+}
+
+// ── 啟動 ──────────────────────────────────────────────────
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`⚙️  HEPHAESTUS API 啟動於 port ${PORT}`));
