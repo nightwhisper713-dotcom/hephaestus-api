@@ -603,6 +603,264 @@ async function buildWord(filename, sections, brand = '幻翔商用設計') {
   return Packer.toBuffer(doc);
 }
 
+// ═══════════════════════════════════════════════════════════
+// /generate/from-file — 核心新端點
+// 前端只要丟檔案 + 指令，後端包辦：
+//   1. 解析各種格式（PDF/XLSX/PPTX/DOCX/圖片/文字）
+//   2. 呼叫 Claude API 分析並生成結構化 JSON
+//   3. 呼叫對應 builder 產出精美文件
+//   4. 直接回傳二進位檔案
+//
+// multipart/form-data:
+//   files[]   — 任意數量與格式的檔案
+//   format    — 'ppt' | 'excel' | 'word'
+//   instruction — 用戶指令（可選）
+//   apiKey    — Claude API Key（由前端傳入，後端不儲存）
+// ═══════════════════════════════════════════════════════════
+app.post('/generate/from-file',
+  upload.array('files', 20),
+  async (req, res) => {
+    const { format = 'ppt', instruction = '', apiKey } = req.body;
+
+    if (!apiKey) {
+      return res.status(400).json({ error: '需要提供 Claude API Key' });
+    }
+    if (!req.files || req.files.length === 0) {
+      return res.status(400).json({ error: '請至少上傳一個檔案' });
+    }
+
+    try {
+      // ── Step 1: 解析所有上傳的檔案，提取文字內容 ──────────
+      const extractedParts = [];
+
+      for (const file of req.files) {
+        const ext = path.extname(file.originalname).toLowerCase();
+        const name = file.originalname;
+
+        if (['.xlsx', '.xls', '.csv'].includes(ext)) {
+          // Excel / CSV 解析
+          try {
+            const wb = XLSX.read(file.buffer, { type: 'buffer', cellDates: true });
+            for (const sheetName of wb.SheetNames) {
+              const ws = wb.Sheets[sheetName];
+              const csv = XLSX.utils.sheet_to_csv(ws);
+              extractedParts.push(`【檔案：${name} / 工作表：${sheetName}】\n${csv.slice(0, 6000)}`);
+            }
+          } catch (e) {
+            extractedParts.push(`【檔案：${name}】（Excel 解析失敗，略過）`);
+          }
+
+        } else if (['.txt', '.md', '.csv'].includes(ext)) {
+          // 純文字
+          const text = file.buffer.toString('utf-8').slice(0, 8000);
+          extractedParts.push(`【檔案：${name}】\n${text}`);
+
+        } else if (['.jpg', '.jpeg', '.png', '.gif', '.webp'].includes(ext)) {
+          // 圖片：轉 base64 送給 Claude Vision
+          const b64 = file.buffer.toString('base64');
+          const mime = {
+            '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+            '.png': 'image/png', '.gif': 'image/gif', '.webp': 'image/webp'
+          }[ext] || 'image/jpeg';
+          extractedParts.push({ type: 'image', name, b64, mime });
+
+        } else if (ext === '.pdf') {
+          // PDF：嘗試用 XLSX 讀取（有時PDF有嵌入表格），否則標記為需Vision
+          extractedParts.push(`【檔案：${name}】（PDF 格式，已轉為 Vision 分析）`);
+          const b64 = file.buffer.toString('base64');
+          extractedParts.push({ type: 'pdf', name, b64 });
+
+        } else {
+          // 其他格式：嘗試當文字讀
+          try {
+            const text = file.buffer.toString('utf-8').slice(0, 5000);
+            if (text && !text.includes('\x00')) {
+              extractedParts.push(`【檔案：${name}】\n${text}`);
+            } else {
+              extractedParts.push(`【檔案：${name}】（二進位格式，略過文字提取）`);
+            }
+          } catch (e) {
+            extractedParts.push(`【檔案：${name}】（無法解析）`);
+          }
+        }
+      }
+
+      // ── Step 2: 組合 Claude API 的 messages ──────────────
+      const claudeMessages = [];
+      const contentBlocks = [];
+      let textContent = '';
+
+      for (const part of extractedParts) {
+        if (typeof part === 'string') {
+          textContent += part + '\n\n';
+        } else if (part.type === 'image') {
+          if (textContent) {
+            contentBlocks.push({ type: 'text', text: textContent });
+            textContent = '';
+          }
+          contentBlocks.push({
+            type: 'image',
+            source: { type: 'base64', media_type: part.mime, data: part.b64 }
+          });
+          contentBlocks.push({ type: 'text', text: `（以上是圖片：${part.name}）` });
+        } else if (part.type === 'pdf') {
+          if (textContent) {
+            contentBlocks.push({ type: 'text', text: textContent });
+            textContent = '';
+          }
+          contentBlocks.push({
+            type: 'document',
+            source: { type: 'base64', media_type: 'application/pdf', data: part.b64 }
+          });
+        }
+      }
+      if (textContent) contentBlocks.push({ type: 'text', text: textContent });
+
+      // 組合最終 prompt
+      const fmtName = { ppt: 'PPT簡報', excel: 'Excel試算表', word: 'Word文件' };
+      const schemas = {
+        ppt: `{"filename":"文件名","slides":[
+{"type":"title","title":"主標題","subtitle":"副標題","brand":"幻翔商用設計"},
+{"type":"stats","title":"數字標題","stats":[{"value":"XX%","label":"說明","sub":"補充"},{"value":"XX","label":"說明","sub":""},{"value":"XX","label":"說明","sub":""}]},
+{"type":"chart","title":"圖表標題","chartType":"bar","chartLabel":"數值","chartData":{"labels":["A","B","C","D"],"values":[80,65,50,40]},"notes":[{"value":"XX%","label":"重點1"},{"value":"XX","label":"重點2"},{"value":"XX","label":"重點3"}]},
+{"type":"two_col","title":"比較標題","leftLabel":"問題/現況","left":["項目1","項目2","項目3","項目4"],"rightLabel":"解決方案/優勢","right":["方案1","方案2","方案3","方案4"]},
+{"type":"cards","title":"特色標題","cards":[{"icon":"🎯","title":"特色名稱","desc":"2-3行說明文字"},{"icon":"📊","title":"特色名稱","desc":"說明"},{"icon":"⚡","title":"特色名稱","desc":"說明"},{"icon":"🔍","title":"特色名稱","desc":"說明"}]},
+{"type":"closing","title":"結語","subtitle":"行動號召文字","brand":"幻翔商用設計"}]}
+
+【強制規定】：
+- 禁止使用 content 版型（純文字清單）
+- 必須按順序使用 title → stats → chart → two_col → cards → closing
+- stats 的 value 必須是從素材中找到的真實數字、百分比或關鍵指標
+- chart 的數據必須來自素材中的比較數據或排名`,
+        excel: `{"filename":"文件名","sheets":[{"name":"工作表名","headers":["欄1","欄2","欄3","欄4"],"rows":[["a","b","c","d"],["e","f","g","h"]],"addSummary":true}]}
+
+【規定】：把素材所有數據完整整理，多個分類可建立多個 sheet`,
+        word: `{"filename":"文件名","brand":"幻翔商用設計","sections":[
+{"type":"h1","text":"主標題"},
+{"type":"h2","text":"章節標題"},
+{"type":"p","text":"段落內容"},
+{"type":"bullet","items":["項目1","項目2","項目3"]},
+{"type":"callout","text":"重要提示或結論"},
+{"type":"table","headers":["欄1","欄2","欄3"],"rows":[["a","b","c"]]}]}
+
+【規定】：完整保留素材所有內容，清楚分章節，重要數字用 callout 標示`
+      };
+
+      const promptText = `請分析以上所有素材，整理成精美的${fmtName[format]}。
+
+${instruction ? `【用戶指令】${instruction}\n` : ''}
+【輸出格式】只輸出純JSON，第一個字元是 { ，最後一個字元是 } ，不加任何說明或 markdown。
+
+${schemas[format]}`;
+
+      contentBlocks.push({ type: 'text', text: promptText });
+      claudeMessages.push({ role: 'user', content: contentBlocks });
+
+      // ── Step 3: 呼叫 Claude API ────────────────────────────
+      const claudeResp = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-api-key': apiKey,
+          'anthropic-version': '2023-06-01'
+        },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-6',
+          max_tokens: 4096,
+          system: '你是 HEPHAESTUS，幻翔設計的文件鍛造師。你只輸出純JSON，第一個字元必須是 {，最後一個字元必須是 }。絕對不加任何說明文字、markdown 符號或程式碼區塊標記。',
+          messages: claudeMessages
+        })
+      });
+
+      if (!claudeResp.ok) {
+        const errData = await claudeResp.json().catch(() => ({}));
+        throw new Error(`Claude API 錯誤 ${claudeResp.status}: ${errData?.error?.message || ''}`);
+      }
+
+      const claudeData = await claudeResp.json();
+      const rawJson = claudeData.content?.map(c => c.text || '').join('') || '';
+
+      // ── Step 4: 解析 JSON ──────────────────────────────────
+      let jsonData;
+      try {
+        let s = rawJson.replace(/^```json\s*/i, '').replace(/^```\s*/, '').replace(/```\s*$/, '').trim();
+        const a = s.indexOf('{'), b = s.lastIndexOf('}');
+        if (a !== -1 && b > a) s = s.slice(a, b + 1);
+        jsonData = JSON.parse(s);
+      } catch (e) {
+        // 二次嘗試：移除換行
+        try {
+          let s2 = rawJson.replace(/[\r\n]/g, ' ');
+          const a = s2.indexOf('{'), b = s2.lastIndexOf('}');
+          if (a !== -1 && b > a) s2 = s2.slice(a, b + 1);
+          jsonData = JSON.parse(s2);
+        } catch (e2) {
+          console.error('JSON parse failed:', rawJson.slice(0, 300));
+          throw new Error('Claude 回傳格式解析失敗，請重試');
+        }
+      }
+
+      // PPT 強制視覺版型：把 content 轉成 cards
+      if (format === 'ppt' && jsonData.slides) {
+        const icons = ['🎯','📊','⚡','🔍','💡','🚀','✅','🌟'];
+        jsonData.slides = jsonData.slides.map(slide => {
+          if (slide.type !== 'content') return slide;
+          const bullets = slide.bullets || [];
+          if (bullets.length >= 3) {
+            return {
+              type: 'cards', title: slide.title || '',
+              cards: bullets.slice(0, 6).map((b, i) => {
+                const parts = String(b).split(/[—\-：:｜|]/);
+                return {
+                  icon: icons[i % icons.length],
+                  title: (parts[0] || '').trim().slice(0, 20) || `特色${i+1}`,
+                  desc: parts.slice(1).join('').trim().slice(0, 60) || String(b).slice(0, 60)
+                };
+              })
+            };
+          }
+          const half = Math.ceil(bullets.length / 2);
+          return {
+            type: 'two_col', title: slide.title || '',
+            leftLabel: '說明', left: bullets.slice(0, half).map(b => String(b).slice(0, 50)),
+            rightLabel: '內容', right: bullets.slice(half).map(b => String(b).slice(0, 50))
+          };
+        });
+      }
+
+      // ── Step 5: 生成精美文件 ───────────────────────────────
+      let fileBuffer, contentType, fileName, fileExt;
+
+      if (format === 'ppt') {
+        fileBuffer = await buildPptx(jsonData.filename || '簡報', jsonData.theme || {}, jsonData.slides || []);
+        contentType = 'application/vnd.openxmlformats-officedocument.presentationml.presentation';
+        fileExt = 'pptx';
+      } else if (format === 'excel') {
+        fileBuffer = buildExcel(jsonData.filename || '試算表', jsonData.sheets || []);
+        contentType = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+        fileExt = 'xlsx';
+      } else if (format === 'word') {
+        fileBuffer = await buildWord(jsonData.filename || '文件', jsonData.sections || [], jsonData.brand || '幻翔商用設計');
+        contentType = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+        fileExt = 'docx';
+      }
+
+      fileName = `${jsonData.filename || '文件'}.${fileExt}`;
+
+      res.set({
+        'Content-Type': contentType,
+        'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(fileName)}`,
+        'Content-Length': fileBuffer.length
+      });
+      res.send(fileBuffer);
+
+    } catch (e) {
+      console.error('/generate/from-file error:', e.message);
+      res.status(500).json({ error: e.message || '伺服器錯誤，請重試' });
+    }
+  }
+);
+
 // ── 啟動 ──────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`⚙️  HEPHAESTUS API 啟動於 port ${PORT}`));
