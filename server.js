@@ -17,6 +17,8 @@ const archiver = require('archiver');
 const path     = require('path');
 const fs       = require('fs');
 const os       = require('os');
+let sharp;
+try { sharp = require('sharp'); } catch(e) { sharp = null; console.log('sharp not available, skipping image conversion'); }
 
 const app = express();
 app.use(cors());
@@ -656,20 +658,27 @@ app.post('/generate/from-file',
           extractedParts.push(`【檔案：${name}】\n${text}`);
 
         } else if (['.jpg', '.jpeg', '.png', '.gif', '.webp'].includes(ext)) {
-          // 圖片：轉 base64 送給 Claude Vision
-          const b64 = file.buffer.toString('base64');
-          const mime = (() => {
-            const raw = {
-              '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
-              '.png': 'image/png', '.gif': 'image/gif', '.webp': 'image/webp'
-            }[ext] || (file.mimetype || 'image/jpeg');
-            // 強制標準化
-            if (raw.includes('png')) return 'image/png';
-            if (raw.includes('gif')) return 'image/gif';
-            if (raw.includes('webp')) return 'image/webp';
-            return 'image/jpeg';
-          })();
-          extractedParts.push({ type: 'image', name, b64, mime });
+          // 圖片：強制轉成標準 PNG（最相容），送給 Claude Vision
+          try {
+            let imgBuf = file.buffer;
+            if (sharp) {
+              // 用 sharp 重新編碼成乾淨的 PNG
+              imgBuf = await sharp(file.buffer).png().toBuffer();
+            }
+            const b64 = imgBuf.toString('base64');
+            extractedParts.push({ type: 'image', name, b64, mime: 'image/png' });
+          } catch (imgErr) {
+            // sharp 轉換失敗，直接用原始 base64
+            const b64 = file.buffer.toString('base64');
+            const mime = (() => {
+              const raw = file.mimetype || file.originalname;
+              if (raw.includes('png')) return 'image/png';
+              if (raw.includes('gif')) return 'image/gif';
+              if (raw.includes('webp')) return 'image/webp';
+              return 'image/jpeg';
+            })();
+            extractedParts.push({ type: 'image', name, b64, mime });
+          }
 
         } else if (ext === '.pdf') {
           // PDF：嘗試用 XLSX 讀取（有時PDF有嵌入表格），否則標記為需Vision
