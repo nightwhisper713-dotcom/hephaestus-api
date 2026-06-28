@@ -658,10 +658,17 @@ app.post('/generate/from-file',
         } else if (['.jpg', '.jpeg', '.png', '.gif', '.webp'].includes(ext)) {
           // 圖片：轉 base64 送給 Claude Vision
           const b64 = file.buffer.toString('base64');
-          const mime = {
-            '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
-            '.png': 'image/png', '.gif': 'image/gif', '.webp': 'image/webp'
-          }[ext] || 'image/jpeg';
+          const mime = (() => {
+            const raw = {
+              '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+              '.png': 'image/png', '.gif': 'image/gif', '.webp': 'image/webp'
+            }[ext] || (file.mimetype || 'image/jpeg');
+            // 強制標準化
+            if (raw.includes('png')) return 'image/png';
+            if (raw.includes('gif')) return 'image/gif';
+            if (raw.includes('webp')) return 'image/webp';
+            return 'image/jpeg';
+          })();
           extractedParts.push({ type: 'image', name, b64, mime });
 
         } else if (ext === '.pdf') {
