@@ -23,6 +23,8 @@ try { sharp = require('sharp'); } catch(e) { sharp = null; console.log('sharp no
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
+const imageProxy = require('./hephaestus-image-proxy');
+app.use(imageProxy);
 
 // Multer — 記憶體儲存，支援多檔
 const upload = multer({
